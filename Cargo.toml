@@ -16,7 +16,7 @@ bytes = "1.7.0"
 flate2 = "1.0.20"
 futures = "0.3.31"
 jpeg = { package = "jpeg-decoder", version = "0.3.0", default-features = false }
-jpeg2k = { version = "0.10.1", optional = true }
+jpeg2k = { version = "0.10.1", optional = true, default-features = false, features = ["openjp2"] }
 lerc = { version = "0.2.1", optional = true }
 lzma-rust2 = { version = "0.15.7", optional = true, features = ["xz"] }
 ndarray = { version = "0.17", optional = true }
