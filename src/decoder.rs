@@ -271,10 +271,12 @@ impl Decoder for JPEG2kDecoder {
             | jpeg2k::ImagePixelData::La8(items)
             | jpeg2k::ImagePixelData::Rgb8(items)
             | jpeg2k::ImagePixelData::Rgba8(items) => Ok(items),
-            jpeg2k::ImagePixelData::L16(items)
-            | jpeg2k::ImagePixelData::La16(items)
-            | jpeg2k::ImagePixelData::Rgb16(items)
-            | jpeg2k::ImagePixelData::Rgba16(items) => Ok(bytemuck::cast_vec(items)),
+            jpeg2k::ImagePixelData::L16(ref items)
+            | jpeg2k::ImagePixelData::La16(ref items)
+            | jpeg2k::ImagePixelData::Rgb16(ref items)
+            | jpeg2k::ImagePixelData::Rgba16(ref items) => {
+                Ok(bytemuck::cast_slice(items).to_vec())
+            }
         }
     }
 }
