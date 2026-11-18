@@ -372,7 +372,12 @@ impl ImageFileDirectory {
             geo_key_directory = Some(GeoKeyDirectory::from_tags(tags)?);
         }
 
-        let samples_per_pixel = samples_per_pixel.expect("samples_per_pixel not found");
+        // TIFF 6.0's defaults: one sample of one bit (a bilevel mask may omit
+        // both). The tags without a default are errors, not panics.
+        let samples_per_pixel = samples_per_pixel.unwrap_or(1);
+        let bits_per_sample =
+            bits_per_sample.unwrap_or_else(|| vec![1; samples_per_pixel as usize]);
+        let missing = |tag: &str| AsyncTiffError::General(format!("a TIFF directory has no {tag}"));
         let planar_configuration = if let Some(planar_configuration) = planar_configuration {
             planar_configuration
         } else if samples_per_pixel == 1 {
@@ -385,14 +390,14 @@ impl ImageFileDirectory {
         Ok(Self {
             endianness,
             new_subfile_type,
-            image_width: image_width.expect("image_width not found"),
-            image_height: image_height.expect("image_height not found"),
-            bits_per_sample: bits_per_sample.expect("bits per sample not found"),
+            image_width: image_width.ok_or_else(|| missing("ImageWidth"))?,
+            image_height: image_height.ok_or_else(|| missing("ImageLength"))?,
+            bits_per_sample,
             // Defaults to no compression
             // https://web.archive.org/web/20240329145331/https://www.awaresystems.be/imaging/tiff/tifftags/compression.html
             compression: compression.unwrap_or(Compression::None),
             photometric_interpretation: photometric_interpretation
-                .expect("photometric interpretation not found"),
+                .ok_or_else(|| missing("PhotometricInterpretation"))?,
             document_name,
             image_description,
             strip_offsets,
