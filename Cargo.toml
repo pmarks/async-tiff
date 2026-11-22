@@ -13,6 +13,7 @@ async-trait = "0.1.89"
 bytemuck = { version = "1.24", features = ["extern_crate_alloc"] }
 byteorder = "1"
 bytes = "1.7.0"
+crc32fast = "1.4"
 flate2 = "1.0.20"
 futures = "0.3.31"
 jpeg = { package = "jpeg-decoder", version = "0.3.0", default-features = false }

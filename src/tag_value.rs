@@ -197,13 +197,8 @@ impl TagValue {
             Short(val) => Ok(vec![val.into()]),
             Unsigned(val) => Ok(vec![val]),
             UnsignedBig(val) => Ok(vec![u32::try_from(val)?]),
-            Rational(numerator, denominator) => Ok(vec![numerator, denominator]),
-            RationalBig(numerator, denominator) => {
-                Ok(vec![u32::try_from(numerator)?, u32::try_from(denominator)?])
-            }
             Ifd(val) => Ok(vec![val]),
             IfdBig(val) => Ok(vec![u32::try_from(val)?]),
-            Ascii(val) => Ok(val.chars().map(u32::from).collect()),
             val => Err(TiffError::FormatError(
                 TiffFormatError::UnsignedIntegerExpected(val),
             )),
@@ -323,11 +318,8 @@ impl TagValue {
             Short(val) => Ok(vec![val.into()]),
             Unsigned(val) => Ok(vec![val.into()]),
             UnsignedBig(val) => Ok(vec![val]),
-            Rational(numerator, denominator) => Ok(vec![numerator.into(), denominator.into()]),
-            RationalBig(numerator, denominator) => Ok(vec![numerator, denominator]),
             Ifd(val) => Ok(vec![val.into()]),
             IfdBig(val) => Ok(vec![val]),
-            Ascii(val) => Ok(val.chars().map(u32::from).map(u64::from).collect()),
             val => Err(TiffError::FormatError(
                 TiffFormatError::UnsignedIntegerExpected(val),
             )),

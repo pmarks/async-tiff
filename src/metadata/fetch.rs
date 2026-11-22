@@ -73,24 +73,9 @@ impl<'a, F: MetadataFetch> MetadataCursor<'a, F> {
         Ok(EndianAwareReader::new(bytes, self.endianness))
     }
 
-    /// Read a u8 from the cursor, advancing the internal state by 1 byte.
-    pub(crate) async fn read_u8(&mut self) -> AsyncTiffResult<u8> {
-        self.read(1).await?.read_u8()
-    }
-
-    /// Read a i8 from the cursor, advancing the internal state by 1 byte.
-    pub(crate) async fn read_i8(&mut self) -> AsyncTiffResult<i8> {
-        self.read(1).await?.read_i8()
-    }
-
     /// Read a u16 from the cursor, advancing the internal state by 2 bytes.
     pub(crate) async fn read_u16(&mut self) -> AsyncTiffResult<u16> {
         self.read(2).await?.read_u16()
-    }
-
-    /// Read a i16 from the cursor, advancing the internal state by 2 bytes.
-    pub(crate) async fn read_i16(&mut self) -> AsyncTiffResult<i16> {
-        self.read(2).await?.read_i16()
     }
 
     /// Read a u32 from the cursor, advancing the internal state by 4 bytes.
@@ -111,10 +96,6 @@ impl<'a, F: MetadataFetch> MetadataCursor<'a, F> {
     /// Read a i64 from the cursor, advancing the internal state by 8 bytes.
     pub(crate) async fn read_i64(&mut self) -> AsyncTiffResult<i64> {
         self.read(8).await?.read_i64()
-    }
-
-    pub(crate) async fn read_f32(&mut self) -> AsyncTiffResult<f32> {
-        self.read(4).await?.read_f32()
     }
 
     pub(crate) async fn read_f64(&mut self) -> AsyncTiffResult<f64> {

@@ -150,6 +150,57 @@ pub struct ImageFileDirectory {
     pub(crate) lerc_parameters: Option<Vec<u32>>,
 }
 
+/// A resolution tag's value: `None` unless it is a positive, finite rational.
+fn resolution(value: &TagValue) -> Option<f64> {
+    match *value {
+        TagValue::Rational(n, d) if d != 0 => Some(n as f64 / d as f64).filter(|r| *r > 0.0),
+        _ => None,
+    }
+}
+
+/// The GeoKeyDirectory's keys: `None` when the directory is malformed (an unknown version, keys
+/// it doesn't hold, a parameter outside the params tags).
+fn geo_keys(
+    data: &[u16],
+    ascii: Option<&str>,
+    doubles: Option<&[f64]>,
+) -> Option<HashMap<GeoKeyTag, TagValue>> {
+    let mut chunks = data.as_chunks::<4>().0.iter();
+    // The key directory version, key revision, minor revision and key count.
+    let &[1, 1, _, number_of_keys] = chunks.next()? else {
+        return None;
+    };
+    let mut tags = HashMap::new();
+    for _ in 0..number_of_keys {
+        let &[key_id, tag_location, count, value_offset] = chunks.next()?;
+        let Ok(tag_name) = GeoKeyTag::try_from_primitive(key_id) else {
+            // Skip unknown GeoKeyTag ids. Some GeoTIFFs include keys that were proposed
+            // but not included in the GeoTIFF spec. See
+            // https://github.com/developmentseed/async-tiff/pull/131 and
+            // https://github.com/virtual-zarr/virtual-tiff/issues/52
+            continue;
+        };
+        let (at, count) = (value_offset as usize, count as usize);
+        if tag_location == 0 {
+            tags.insert(tag_name, TagValue::Short(value_offset));
+        } else if Tag::from_u16_exhaustive(tag_location) == Tag::GeoAsciiParams {
+            // A subslice of GeoAsciiParams, which may end with its '|'.
+            let s = ascii?.get(at..at.checked_add(count)?)?;
+            let s = s.strip_suffix('|').unwrap_or(s);
+            tags.insert(tag_name, TagValue::Ascii(s.to_string()));
+        } else if Tag::from_u16_exhaustive(tag_location) == Tag::GeoDoubleParams {
+            let values = doubles?.get(at..at.checked_add(count)?)?;
+            let value = if count == 1 {
+                TagValue::Double(values[0])
+            } else {
+                TagValue::List(values.iter().map(|v| TagValue::Double(*v)).collect())
+            };
+            tags.insert(tag_name, value);
+        }
+    }
+    Some(tags)
+}
+
 impl ImageFileDirectory {
     /// Create a new ImageFileDirectory from tag data
     pub fn from_tags(
@@ -222,16 +273,14 @@ impl ImageFileDirectory {
                 Tag::StripByteCounts => strip_byte_counts = Some(value.into_u64_vec()?),
                 Tag::MinSampleValue => min_sample_value = Some(value.into_u16_vec()?),
                 Tag::MaxSampleValue => max_sample_value = Some(value.into_u16_vec()?),
-                Tag::XResolution => match value {
-                    TagValue::Rational(n, d) => x_resolution = Some(n as f64 / d as f64),
-                    _ => unreachable!("Expected rational type for XResolution."),
-                },
-                Tag::YResolution => match value {
-                    TagValue::Rational(n, d) => y_resolution = Some(n as f64 / d as f64),
-                    _ => unreachable!("Expected rational type for YResolution."),
-                },
+                // A resolution that isn't a positive rational is no resolution.
+                Tag::XResolution => x_resolution = resolution(&value),
+                Tag::YResolution => y_resolution = resolution(&value),
                 Tag::PlanarConfiguration => {
-                    planar_configuration = PlanarConfiguration::from_u16(value.into_u16()?)
+                    planar_configuration = Some(
+                        PlanarConfiguration::from_u16(value.into_u16()?)
+                            .ok_or(TiffError::FormatError(TiffFormatError::InvalidTag))?,
+                    )
                 }
                 Tag::ResolutionUnit => {
                     resolution_unit = ResolutionUnit::from_u16(value.into_u16()?)
@@ -240,7 +289,12 @@ impl ImageFileDirectory {
                 Tag::DateTime => date_time = Some(value.into_string()?),
                 Tag::Artist => artist = Some(value.into_string()?),
                 Tag::HostComputer => host_computer = Some(value.into_string()?),
-                Tag::Predictor => predictor = Predictor::from_u16(value.into_u16()?),
+                Tag::Predictor => {
+                    predictor = Some(
+                        Predictor::from_u16(value.into_u16()?)
+                            .ok_or(TiffError::FormatError(TiffFormatError::InvalidTag))?,
+                    )
+                }
                 Tag::ColorMap => color_map = Some(Arc::from(value.into_u16_vec()?)),
                 Tag::TileWidth => tile_width = Some(value.into_u32()?),
                 Tag::TileLength => tile_height = Some(value.into_u32()?),
@@ -295,80 +349,12 @@ impl ImageFileDirectory {
         // We need to actually parse the GeoKeyDirectory after parsing all other tags because the
         // GeoKeyDirectory relies on `GeoAsciiParamsTag` having been parsed.
         if let Some(data) = geo_key_directory_data {
-            let mut chunks = data.chunks(4);
-
-            let header = chunks
-                .next()
-                .expect("If the geo key directory exists, a header should exist.");
-            let key_directory_version = header[0];
-            assert_eq!(key_directory_version, 1);
-
-            let key_revision = header[1];
-            assert_eq!(key_revision, 1);
-
-            let _key_minor_revision = header[2];
-            let number_of_keys = header[3];
-
-            let mut tags = HashMap::with_capacity(number_of_keys as usize);
-            for _ in 0..number_of_keys {
-                let chunk = chunks
-                    .next()
-                    .expect("There should be a chunk for each key.");
-
-                let key_id = chunk[0];
-                let tag_name = if let Ok(tag_name) = GeoKeyTag::try_from_primitive(key_id) {
-                    tag_name
-                } else {
-                    // Skip unknown GeoKeyTag ids. Some GeoTIFFs include keys that were proposed
-                    // but not included in the GeoTIFF spec. See
-                    // https://github.com/developmentseed/async-tiff/pull/131 and
-                    // https://github.com/virtual-zarr/virtual-tiff/issues/52
-                    continue;
-                };
-
-                let tag_location = chunk[1];
-                let count = chunk[2];
-                let value_offset = chunk[3];
-
-                if tag_location == 0 {
-                    tags.insert(tag_name, TagValue::Short(value_offset));
-                } else if Tag::from_u16_exhaustive(tag_location) == Tag::GeoAsciiParams {
-                    // If the tag_location points to the value of Tag::GeoAsciiParams, then we
-                    // need to extract a subslice from GeoAsciiParams
-
-                    let geo_ascii_params = geo_ascii_params
-                        .as_ref()
-                        .expect("GeoAsciiParamsTag exists but geo_ascii_params does not.");
-                    let value_offset = value_offset as usize;
-                    let mut s = &geo_ascii_params[value_offset..value_offset + count as usize];
-
-                    // It seems that this string subslice might always include the final |
-                    // character?
-                    if s.ends_with('|') {
-                        s = &s[0..s.len() - 1];
-                    }
-
-                    tags.insert(tag_name, TagValue::Ascii(s.to_string()));
-                } else if Tag::from_u16_exhaustive(tag_location) == Tag::GeoDoubleParams {
-                    // If the tag_location points to the value of Tag::GeoDoubleParams, then we
-                    // need to extract a subslice from GeoDoubleParams
-
-                    let geo_double_params = geo_double_params
-                        .as_ref()
-                        .expect("GeoDoubleParamsTag exists but geo_double_params does not.");
-                    let value_offset = value_offset as usize;
-                    let value = if count == 1 {
-                        TagValue::Double(geo_double_params[value_offset])
-                    } else {
-                        let x = geo_double_params[value_offset..value_offset + count as usize]
-                            .iter()
-                            .map(|val| TagValue::Double(*val))
-                            .collect();
-                        TagValue::List(x)
-                    };
-                    tags.insert(tag_name, value);
-                }
-            }
+            let tags = geo_keys(
+                &data,
+                geo_ascii_params.as_deref(),
+                geo_double_params.as_deref(),
+            )
+            .ok_or(TiffError::FormatError(TiffFormatError::InvalidTag))?;
             geo_key_directory = Some(GeoKeyDirectory::from_tags(tags)?);
         }
 
@@ -377,6 +363,9 @@ impl ImageFileDirectory {
         let samples_per_pixel = samples_per_pixel.unwrap_or(1);
         let bits_per_sample =
             bits_per_sample.unwrap_or_else(|| vec![1; samples_per_pixel as usize]);
+        if bits_per_sample.is_empty() {
+            return Err(TiffError::FormatError(TiffFormatError::InvalidTag).into());
+        }
         let missing = |tag: &str| AsyncTiffError::General(format!("a TIFF directory has no {tag}"));
         let planar_configuration = if let Some(planar_configuration) = planar_configuration {
             planar_configuration
@@ -930,5 +919,19 @@ impl CompressedBytes {
             jpeg_tables: ifd.jpeg_tables.clone(),
             lerc_parameters: ifd.lerc_parameters.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// A resolution that isn't a positive rational is no resolution, not a panic.
+    #[test]
+    fn a_resolution_is_a_positive_rational() {
+        assert_eq!(resolution(&TagValue::Rational(300, 1)), Some(300.0));
+        assert_eq!(resolution(&TagValue::Rational(1, 0)), None);
+        assert_eq!(resolution(&TagValue::Rational(0, 1)), None);
+        assert_eq!(resolution(&TagValue::Short(300)), None);
     }
 }
