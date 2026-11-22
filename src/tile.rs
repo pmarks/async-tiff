@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use crate::array::Array;
 use crate::decoder::DecoderRegistry;
-use crate::error::{AsyncTiffResult, TiffError, TiffUnsupportedError};
+use crate::error::{AsyncTiffError, AsyncTiffResult, TiffError, TiffUnsupportedError};
 use crate::ifd::CompressedBytes;
 use crate::predictor::{fix_endianness, unpredict_float, unpredict_hdiff};
 use crate::reader::Endianness;
@@ -89,6 +89,16 @@ impl Tile {
         let bits_per_sample = self.bits_per_sample;
         // tile_width is the full encoded tile width — predictor must use this, not the cropped width
         let tile_width = self.width as usize;
+        // The most a chunk (a band's, when planar) may decode to.
+        let bytes_per_sample = (bits_per_sample as usize).div_ceil(8);
+        let band_samples = match &self.compressed_bytes {
+            CompressedBytes::Chunky(_) => samples,
+            CompressedBytes::Planar(_) => 1,
+        };
+        let max_out = [tile_width, self.height as usize, band_samples]
+            .iter()
+            .try_fold(bytes_per_sample, |n, &d| n.checked_mul(d))
+            .ok_or_else(|| AsyncTiffError::General("a tile too large to size".to_string()))?;
 
         let mut decoded_tile = match &self.compressed_bytes {
             CompressedBytes::Chunky(bytes) => decoder.decode_tile(
@@ -98,6 +108,7 @@ impl Tile {
                 self.samples_per_pixel,
                 bits_per_sample,
                 self.lerc_parameters.as_deref(),
+                max_out,
             )?,
             CompressedBytes::Planar(band_bytes) => {
                 let bytes_per_sample = (bits_per_sample as usize).div_ceil(8);
@@ -113,6 +124,7 @@ impl Tile {
                         1,
                         bits_per_sample,
                         self.lerc_parameters.as_deref(),
+                        max_out,
                     )?;
                     result.extend_from_slice(&decoded_band);
                 }

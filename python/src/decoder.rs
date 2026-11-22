@@ -82,8 +82,15 @@ impl Decoder for PyDecoder {
         _samples_per_pixel: u16,
         _bits_per_sample: u16,
         _lerc_parameters: Option<&[u32]>,
+        max_out: usize,
     ) -> AsyncTiffResult<Vec<u8>> {
-        Python::attach(|py| self.call(py, buffer))
-            .map_err(|err| AsyncTiffError::General(err.to_string()))
+        let decoded = Python::attach(|py| self.call(py, buffer))
+            .map_err(|err| AsyncTiffError::General(err.to_string()))?;
+        if decoded.len() > max_out {
+            return Err(AsyncTiffError::General(format!(
+                "a tile decodes to more than its {max_out} bytes"
+            )));
+        }
+        Ok(decoded)
     }
 }

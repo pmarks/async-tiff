@@ -69,7 +69,11 @@ impl Default for DecoderRegistry {
 
 /// A trait to decode a TIFF tile.
 pub trait Decoder: Debug + Send + Sync {
-    /// Decode a TIFF tile.
+    /// Decode a TIFF tile into at most `max_out` bytes, the most its samples
+    /// fill. A tile that decodes to more is an error, found before much
+    /// more than `max_out` bytes are made: a small hostile tile must not
+    /// expand to gigabytes.
+    #[allow(clippy::too_many_arguments)]
     fn decode_tile(
         &self,
         buffer: Bytes,
@@ -78,7 +82,26 @@ pub trait Decoder: Debug + Send + Sync {
         samples_per_pixel: u16,
         bits_per_sample: u16,
         lerc_parameters: Option<&[u32]>,
+        max_out: usize,
     ) -> AsyncTiffResult<Vec<u8>>;
+}
+
+/// The error for a tile that decodes to more than its `max_out` bytes.
+fn too_large(max_out: usize) -> AsyncTiffError {
+    AsyncTiffError::General(format!("a tile decodes to more than its {max_out} bytes"))
+}
+
+/// `reader` read to its end, or an error once it gives more than `max_out`
+/// bytes.
+pub fn read_capped(reader: impl Read, max_out: usize) -> AsyncTiffResult<Vec<u8>> {
+    let mut out = Vec::new();
+    reader
+        .take((max_out as u64).saturating_add(1))
+        .read_to_end(&mut out)?;
+    if out.len() > max_out {
+        return Err(too_large(max_out));
+    }
+    Ok(out)
 }
 
 /// A decoder for the Deflate compression method.
@@ -94,11 +117,9 @@ impl Decoder for DeflateDecoder {
         _samples_per_pixel: u16,
         _bits_per_sample: u16,
         _lerc_parameters: Option<&[u32]>,
+        max_out: usize,
     ) -> AsyncTiffResult<Vec<u8>> {
-        let mut decoder = ZlibDecoder::new(Cursor::new(buffer));
-        let mut buf = Vec::new();
-        decoder.read_to_end(&mut buf)?;
-        Ok(buf)
+        read_capped(ZlibDecoder::new(Cursor::new(buffer)), max_out)
     }
 }
 
@@ -115,8 +136,9 @@ impl Decoder for JPEGDecoder {
         _samples_per_pixel: u16,
         _bits_per_sample: u16,
         _lerc_parameters: Option<&[u32]>,
+        max_out: usize,
     ) -> AsyncTiffResult<Vec<u8>> {
-        decode_modern_jpeg(buffer, photometric_interpretation, jpeg_tables)
+        decode_modern_jpeg(buffer, photometric_interpretation, jpeg_tables, max_out)
     }
 }
 
@@ -156,28 +178,34 @@ impl Decoder for LercDecoder {
         _samples_per_pixel: u16,
         _bits_per_sample: u16,
         lerc_parameters: Option<&[u32]>,
+        max_out: usize,
     ) -> AsyncTiffResult<Vec<u8>> {
         // LercParameters[1] is the inner compression type:
         //   0 = none, 1 = deflate, 2 = zstd
         // Decompress the outer wrapper before passing to the LERC decoder.
+        // A LERC blob is near its samples' size: twice it, and its header,
+        // bounds the wrapper.
+        let blob_cap = max_out.saturating_mul(2).saturating_add(1 << 16);
         let lerc_blob: Vec<u8> = match lerc_parameters.and_then(|p| p.get(1).copied()) {
-            Some(1) => {
-                let mut decoder = ZlibDecoder::new(Cursor::new(buffer));
-                let mut buf = Vec::new();
-                decoder.read_to_end(&mut buf)?;
-                buf
-            }
-            Some(2) => {
-                let mut decoder = zstd::Decoder::new(Cursor::new(buffer))?;
-                let mut buf = Vec::new();
-                decoder.read_to_end(&mut buf)?;
-                buf
-            }
+            Some(1) => read_capped(ZlibDecoder::new(Cursor::new(buffer)), blob_cap)?,
+            Some(2) => read_capped(zstd::Decoder::new(Cursor::new(buffer))?, blob_cap)?,
             _ => buffer.to_vec(),
         };
 
         let info = lerc::get_blob_info(&lerc_blob)
             .map_err(|e| AsyncTiffError::General(format!("LERC get_blob_info failed: {e}")))?;
+        let width = match info.data_type {
+            0 | 1 => 1,
+            2 | 3 => 2,
+            4..=6 => 4,
+            _ => 8,
+        };
+        let bytes = [info.width, info.height, info.depth, info.bands]
+            .iter()
+            .try_fold(width, |n: usize, &d| n.checked_mul(d as usize));
+        if bytes.is_none_or(|n| n > max_out) {
+            return Err(too_large(max_out));
+        }
 
         // LERC data_type mapping (from LERC C API):
         // 0=i8, 1=u8, 2=i16, 3=u16, 4=i32, 5=u32, 6=f32, 7=f64
@@ -213,14 +241,12 @@ impl Decoder for LZMADecoder {
         _samples_per_pixel: u16,
         _bits_per_sample: u16,
         _lerc_parameters: Option<&[u32]>,
+        max_out: usize,
     ) -> AsyncTiffResult<Vec<u8>> {
         use bytes::Buf;
         use lzma_rust2::XzReader;
 
-        let mut reader = XzReader::new(buffer.reader(), false);
-        let mut out = Vec::new();
-        reader.read_to_end(&mut out)?;
-        Ok(out)
+        read_capped(XzReader::new(buffer.reader(), false), max_out)
     }
 }
 
@@ -237,11 +263,29 @@ impl Decoder for LZWDecoder {
         _samples_per_pixel: u16,
         _bits_per_sample: u16,
         _lerc_parameters: Option<&[u32]>,
+        max_out: usize,
     ) -> AsyncTiffResult<Vec<u8>> {
         // https://github.com/image-rs/image-tiff/blob/90ae5b8e54356a35e266fb24e969aafbcb26e990/src/decoder/stream.rs#L147
         let mut decoder = weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8);
-        let decoded = decoder.decode(&buffer).expect("failed to decode LZW data");
-        Ok(decoded)
+        let mut out = Vec::new();
+        let mut step = vec![0u8; max_out.clamp(1, 1 << 16)];
+        let mut input = &buffer[..];
+        loop {
+            let result = decoder.decode_bytes(input, &mut step);
+            input = &input[result.consumed_in..];
+            out.extend_from_slice(&step[..result.consumed_out]);
+            if out.len() > max_out {
+                return Err(too_large(max_out));
+            }
+            let status = result
+                .status
+                .map_err(|e| AsyncTiffError::General(format!("bad LZW data: {e}")))?;
+            match status {
+                weezl::LzwStatus::Ok => {}
+                // A TIFF writer may leave out the end code.
+                weezl::LzwStatus::Done | weezl::LzwStatus::NoProgress => return Ok(out),
+            }
+        }
     }
 }
 
@@ -260,7 +304,12 @@ impl Decoder for JPEG2kDecoder {
         _samples_per_pixel: u16,
         _bits_per_sample: u16,
         _lerc_parameters: Option<&[u32]>,
+        max_out: usize,
     ) -> AsyncTiffResult<Vec<u8>> {
+        let header = Jpeg2kHeader::parse(&buffer)?;
+        if header.decoded_bytes().is_none_or(|n| n > max_out) {
+            return Err(too_large(max_out));
+        }
         let decoder = jpeg2k::DecodeParameters::new();
 
         let image = jpeg2k::Image::from_bytes_with(&buffer, decoder)?;
@@ -279,6 +328,108 @@ impl Decoder for JPEG2kDecoder {
     }
 }
 
+/// What a JPEG 2000 codestream's SIZ marker declares: read before it is
+/// decoded, to refuse one too large for its tile.
+#[cfg(feature = "jpeg2k")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Jpeg2kHeader {
+    /// The image's width and height on the reference grid.
+    pub size: [u32; 2],
+    /// Its components, in order.
+    pub components: Vec<Jpeg2kComponent>,
+}
+
+/// One component of a [`Jpeg2kHeader`].
+#[cfg(feature = "jpeg2k")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Jpeg2kComponent {
+    /// A sample's precision in bits.
+    pub bits: u8,
+    /// Whether its samples are signed.
+    pub signed: bool,
+    /// Its subsampling across and down: 1 for none.
+    pub subsampling: [u8; 2],
+}
+
+#[cfg(feature = "jpeg2k")]
+impl Jpeg2kHeader {
+    /// The header of `buffer`, a codestream or a JP2 file holding one.
+    pub fn parse(buffer: &[u8]) -> AsyncTiffResult<Jpeg2kHeader> {
+        let bad = |why: &str| AsyncTiffError::General(format!("a JPEG 2000 header {why}"));
+        let cs = codestream(buffer).ok_or_else(|| bad("isn't there"))?;
+        let u16_at = |i: usize| cs.get(i..i + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+        let u32_at = |i: usize| {
+            cs.get(i..i + 4)
+                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        if u16_at(0) != Some(0xFF4F) || u16_at(2) != Some(0xFF51) {
+            return Err(bad("doesn't start with SOC and SIZ"));
+        }
+        let read = || {
+            let size = [
+                u32_at(8)?.checked_sub(u32_at(16)?)?,
+                u32_at(12)?.checked_sub(u32_at(20)?)?,
+            ];
+            let components = (0..usize::from(u16_at(40)?))
+                .map(|c| {
+                    let [s, dx, dy] = cs.get(42 + 3 * c..45 + 3 * c)?.try_into().ok()?;
+                    Some(Jpeg2kComponent {
+                        bits: (s & 0x7F) + 1,
+                        signed: s & 0x80 != 0,
+                        subsampling: [dx, dy],
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(Jpeg2kHeader { size, components })
+        };
+        read().ok_or_else(|| bad("is cut short"))
+    }
+
+    /// The most bytes it can decode to: every component at full size, in
+    /// whole bytes per sample. `None` past a `usize`.
+    pub fn decoded_bytes(&self) -> Option<usize> {
+        let bits = self.components.iter().map(|c| c.bits).max().unwrap_or(0);
+        let width = usize::from(bits.div_ceil(8));
+        [
+            self.size[0] as usize,
+            self.size[1] as usize,
+            self.components.len(),
+        ]
+        .iter()
+        .try_fold(width, |n, &d| n.checked_mul(d))
+    }
+}
+
+/// The codestream in `buffer`: all of it, or a JP2 file's `jp2c` box.
+#[cfg(feature = "jpeg2k")]
+fn codestream(buffer: &[u8]) -> Option<&[u8]> {
+    const JP2: [u8; 12] = [0, 0, 0, 12, b'j', b'P', b' ', b' ', 13, 10, 0x87, 10];
+    if !buffer.starts_with(&JP2) {
+        return Some(buffer);
+    }
+    let mut at = 0usize;
+    while at < buffer.len() {
+        let head = buffer.get(at..at + 8)?;
+        let (len, kind) = (u32::from_be_bytes(head[..4].try_into().ok()?), &head[4..8]);
+        let (start, end) = match len {
+            0 => (at + 8, buffer.len()),
+            1 => {
+                let xl = u64::from_be_bytes(buffer.get(at + 8..at + 16)?.try_into().ok()?);
+                (at + 16, at.checked_add(usize::try_from(xl).ok()?)?)
+            }
+            n => (at + 8, at.checked_add(n as usize)?),
+        };
+        if kind == b"jp2c" {
+            return buffer.get(start..end);
+        }
+        if end <= at {
+            return None;
+        }
+        at = end;
+    }
+    None
+}
+
 /// A decoder for the WebP compression method.
 #[cfg(feature = "webp")]
 #[derive(Debug, Clone)]
@@ -294,7 +445,16 @@ impl Decoder for WebPDecoder {
         samples_per_pixel: u16,
         bits_per_sample: u16,
         _lerc_parameters: Option<&[u32]>,
+        max_out: usize,
     ) -> AsyncTiffResult<Vec<u8>> {
+        let features = webp::BitstreamFeatures::new(&buffer)
+            .ok_or(AsyncTiffError::General("WebP decoding failed".to_string()))?;
+        let bytes = (features.width() as usize)
+            .checked_mul(features.height() as usize)
+            .and_then(|n| n.checked_mul(if samples_per_pixel == 4 { 4 } else { 3 }));
+        if bytes.is_none_or(|n| n > max_out) {
+            return Err(too_large(max_out));
+        }
         let decoded = webp::Decoder::new(&buffer)
             .decode()
             .ok_or(AsyncTiffError::General("WebP decoding failed".to_string()))?;
@@ -330,8 +490,10 @@ impl Decoder for UncompressedDecoder {
         _samples_per_pixel: u16,
         _bits_per_sample: u16,
         _lerc_parameters: Option<&[u32]>,
+        max_out: usize,
     ) -> AsyncTiffResult<Vec<u8>> {
-        Ok(buffer.to_vec())
+        // Past its samples, a tile's bytes are padding.
+        Ok(buffer[..buffer.len().min(max_out)].to_vec())
     }
 }
 
@@ -348,11 +510,9 @@ impl Decoder for ZstdDecoder {
         _samples_per_pixel: u16,
         _bits_per_sample: u16,
         _lerc_parameters: Option<&[u32]>,
+        max_out: usize,
     ) -> AsyncTiffResult<Vec<u8>> {
-        let mut decoder = zstd::Decoder::new(Cursor::new(buffer))?;
-        let mut buf = Vec::new();
-        decoder.read_to_end(&mut buf)?;
-        Ok(buf)
+        read_capped(zstd::Decoder::new(Cursor::new(buffer))?, max_out)
     }
 }
 
@@ -361,6 +521,7 @@ fn decode_modern_jpeg(
     buf: Bytes,
     photometric_interpretation: PhotometricInterpretation,
     jpeg_tables: Option<&[u8]>,
+    max_out: usize,
 ) -> AsyncTiffResult<Vec<u8>> {
     // Construct new jpeg_reader wrapping a SmartReader.
     //
@@ -379,13 +540,19 @@ fn decode_modern_jpeg(
             let mut reader = reader;
             reader.read_exact(&mut [0; 2])?;
 
-            Box::new(Cursor::new(&jpeg_tables[..jpeg_tables.len() - 2]).chain(reader))
-                as Box<dyn Read>
+            let end = jpeg_tables
+                .len()
+                .checked_sub(2)
+                .ok_or(AsyncTiffError::General(
+                    "JPEGTables is too short to hold an EOI marker".to_string(),
+                ))?;
+            Box::new(Cursor::new(&jpeg_tables[..end]).chain(reader)) as Box<dyn Read>
         }
         None => Box::new(reader),
     };
 
     let mut decoder = jpeg::Decoder::new(jpeg_reader);
+    decoder.set_max_decoding_buffer_size(max_out);
 
     match photometric_interpretation {
         PhotometricInterpretation::RGB => decoder.set_color_transform(jpeg::ColorTransform::RGB),
@@ -406,6 +573,117 @@ fn decode_modern_jpeg(
         }
     }
 
+    // The decoder checks its limit only once the planes are made: read the
+    // frame's size first.
+    decoder.read_info()?;
+    let bytes = decoder.info().and_then(|info| {
+        let width = match info.pixel_format {
+            jpeg::PixelFormat::L8 => 1,
+            jpeg::PixelFormat::L16 => 2,
+            jpeg::PixelFormat::RGB24 => 3,
+            jpeg::PixelFormat::CMYK32 => 4,
+        };
+        (info.width as usize)
+            .checked_mul(info.height as usize)
+            .and_then(|n| n.checked_mul(width))
+    });
+    if bytes.is_none_or(|n| n > max_out) {
+        return Err(too_large(max_out));
+    }
     let data = decoder.decode()?;
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn decode(decoder: &dyn Decoder, stream: Vec<u8>, max_out: usize) -> AsyncTiffResult<Vec<u8>> {
+        decoder.decode_tile(
+            Bytes::from(stream),
+            PhotometricInterpretation::BlackIsZero,
+            None,
+            1,
+            8,
+            None,
+            max_out,
+        )
+    }
+
+    /// Each general-purpose codec gives a tile its bytes, and refuses one
+    /// that inflates past them before it is made.
+    #[test]
+    fn a_tile_decodes_to_at_most_max_out() {
+        let tile = vec![7u8; 4096];
+        let mut deflate = flate2::write::ZlibEncoder::new(vec![], flate2::Compression::best());
+        deflate.write_all(&tile).unwrap();
+        let deflate = deflate.finish().unwrap();
+        let zstd = zstd::encode_all(&tile[..], 3).unwrap();
+        let lzw = weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
+            .encode(&tile)
+            .unwrap();
+        let cases: [(&dyn Decoder, Vec<u8>); 3] = [
+            (&DeflateDecoder, deflate),
+            (&ZstdDecoder, zstd),
+            (&LZWDecoder, lzw),
+        ];
+        for (decoder, stream) in cases {
+            assert_eq!(
+                decode(decoder, stream.clone(), 4096).unwrap(),
+                tile,
+                "{decoder:?}"
+            );
+            assert!(decode(decoder, stream, 4095).is_err(), "{decoder:?}");
+        }
+        assert_eq!(
+            decode(&UncompressedDecoder, tile.clone(), 100)
+                .unwrap()
+                .len(),
+            100
+        );
+    }
+
+    /// Garbage given to LZW is an error, not a panic.
+    #[test]
+    fn bad_lzw_is_an_error() {
+        assert!(decode(&LZWDecoder, vec![0xFF; 64], 1 << 20).is_err());
+    }
+
+    /// A JPEGTables shorter than its EOI marker is an error, not a panic.
+    #[test]
+    fn short_jpeg_tables_are_an_error() {
+        let decoded = JPEGDecoder.decode_tile(
+            Bytes::from_static(&[0xFF, 0xD8, 0xFF, 0xD9]),
+            PhotometricInterpretation::BlackIsZero,
+            Some(&[0xFF]),
+            1,
+            8,
+            None,
+            64,
+        );
+        assert!(decoded.is_err());
+    }
+
+    /// A JPEG 2000 header is read from a codestream or a JP2 file.
+    #[cfg(feature = "jpeg2k")]
+    #[test]
+    fn a_jpeg2000_header_is_read() {
+        let mut cs = vec![0xFF, 0x4F, 0xFF, 0x51, 0, 47, 0, 0];
+        for v in [2048u32, 1024, 0, 0, 2048, 1024, 0, 0] {
+            cs.extend(v.to_be_bytes());
+        }
+        cs.extend([0, 3, 7, 1, 1, 7, 2, 1, 7, 2, 1]);
+        let header = Jpeg2kHeader::parse(&cs).unwrap();
+        assert_eq!(header.size, [2048, 1024]);
+        assert_eq!(header.components[1].subsampling, [2, 1]);
+        assert_eq!(header.decoded_bytes(), Some(2048 * 1024 * 3));
+        let mut jp2 = vec![0, 0, 0, 12, b'j', b'P', b' ', b' ', 13, 10, 0x87, 10];
+        jp2.extend((8 + cs.len() as u32).to_be_bytes());
+        jp2.extend(b"jp2c");
+        jp2.extend(&cs);
+        assert_eq!(Jpeg2kHeader::parse(&jp2).unwrap(), header);
+        assert!(Jpeg2kHeader::parse(&cs[..30]).is_err());
+    }
 }
