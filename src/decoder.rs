@@ -251,33 +251,24 @@ impl Decoder for LZMADecoder {
     }
 }
 
-/// `stream`, one XZ stream, with each block's LZMA2 dictionary no larger than the `max_out`
+/// `stream`, an XZ stream, with each block's LZMA2 dictionary no larger than the `max_out`
 /// bytes it may decode to: a decoder allocates the dictionary a block declares, up to 4 GiB,
-/// before it reads a byte, and no match reaches further back than the output. Each changed block
-/// header gets its CRC again, so the reader still checks the whole stream. A stream its index
-/// says decodes to more than `max_out` is refused.
+/// before it reads a byte, and no match reaches further back than the output. The blocks are
+/// found as the reader will meet them, each after the last one's LZMA2 chunks (whose headers
+/// give their sizes), never from the index, which could lie. Each changed block header gets its
+/// CRC again, so the reader still checks the whole stream. A stream whose chunks decode to more
+/// than `max_out` is refused before any is decoded.
 #[cfg(feature = "lzma")]
 fn xz_within(stream: Bytes, max_out: usize) -> AsyncTiffResult<Bytes> {
     let malformed = || AsyncTiffError::General("a malformed XZ stream".into());
     let mut data = stream.to_vec();
-    // Stream padding: groups of four zero bytes.
-    let mut end = data.len();
-    while end >= 4 && data[end - 4..end] == [0; 4] {
-        end -= 4;
-    }
-    if end < 24 || data[..6] != *b"\xFD7zXZ\0" || data[end - 2..end] != *b"YZ" {
+    if data.len() < 12 || data[..6] != *b"\xFD7zXZ\0" {
         return Err(malformed());
     }
     let check = match data[7] & 0x0F {
         0 => 0,
         id => 4usize << ((id - 1) / 3),
     };
-    // The index, which the footer's backward size locates.
-    let backward = u32::from_le_bytes(data[end - 8..end - 4].try_into().expect("four bytes"));
-    let index_size = (backward as usize + 1) * 4;
-    let index_at = (end - 12).checked_sub(index_size).ok_or_else(malformed)?;
-    let index = data[index_at..end - 12].to_vec();
-    let mut index = index.as_slice();
     let varint = |bytes: &mut &[u8]| -> Option<u64> {
         let mut value = 0u64;
         for i in 0..9 {
@@ -290,11 +281,6 @@ fn xz_within(stream: Bytes, max_out: usize) -> AsyncTiffResult<Bytes> {
         }
         None
     };
-    if index.first() != Some(&0) {
-        return Err(malformed());
-    }
-    index = &index[1..];
-    let records = varint(&mut index).ok_or_else(malformed)?;
     // The smallest LZMA2 dictionary code whose size holds `max_out`.
     let dict = |code: u8| -> u64 {
         match code {
@@ -305,14 +291,16 @@ fn xz_within(stream: Bytes, max_out: usize) -> AsyncTiffResult<Bytes> {
     let enough = (0..40)
         .find(|&code| dict(code) >= max_out as u64)
         .unwrap_or(40);
+    let be16 = |data: &[u8], at: usize| -> Option<u64> {
+        Some(u64::from(u16::from_be_bytes([
+            *data.get(at)?,
+            *data.get(at + 1)?,
+        ])))
+    };
     let (mut at, mut total) = (12usize, 0u64);
-    for _ in 0..records {
-        let unpadded = varint(&mut index).ok_or_else(malformed)?;
-        total = total.saturating_add(varint(&mut index).ok_or_else(malformed)?);
-        if total > max_out as u64 {
-            return Err(too_large(max_out));
-        }
-        let size = (usize::from(*data.get(at).ok_or_else(malformed)?) + 1) * 4;
+    // A block header's first byte is its size; a zero starts the index.
+    while *data.get(at).ok_or_else(malformed)? != 0 {
+        let size = (usize::from(data[at]) + 1) * 4;
         let header = data.get(at..at + size).ok_or_else(malformed)?;
         let flags = header[1];
         let mut fields = &header[2..size - 4];
@@ -325,7 +313,8 @@ fn xz_within(stream: Bytes, max_out: usize) -> AsyncTiffResult<Bytes> {
         let mut oversized = vec![];
         for _ in 0..=(flags & 0x03) {
             let id = varint(&mut fields).ok_or_else(malformed)?;
-            let props = varint(&mut fields).ok_or_else(malformed)? as usize;
+            let props = usize::try_from(varint(&mut fields).ok_or_else(malformed)?)
+                .map_err(|_| malformed())?;
             if id == 0x21 && props == 1 && fields.first().is_some_and(|&code| code > enough) {
                 oversized.push(size - 4 - fields.len());
             }
@@ -339,10 +328,41 @@ fn xz_within(stream: Bytes, max_out: usize) -> AsyncTiffResult<Bytes> {
             let crc = crc32fast::hash(&header[..size - 4]);
             header[size - 4..].copy_from_slice(&crc.to_le_bytes());
         }
-        let padded = usize::try_from(unpadded.div_ceil(4) * 4).map_err(|_| malformed())?;
-        at = at.checked_add(padded + check).ok_or_else(malformed)?;
+        // The block's LZMA2 chunks, to the end marker: uncompressed ones (control 1, 2) and
+        // compressed ones (0x80 up, with properties from 0xC0).
+        let mut chunk = at + size;
+        loop {
+            let control = *data.get(chunk).ok_or_else(malformed)?;
+            let (out, skip) = match control {
+                0 => break,
+                1 | 2 => {
+                    let n = be16(&data, chunk + 1).ok_or_else(malformed)? + 1;
+                    (n, 3 + n)
+                }
+                0x80.. => {
+                    let high = u64::from(control & 0x1F) << 16;
+                    let out = high + be16(&data, chunk + 1).ok_or_else(malformed)? + 1;
+                    let packed = be16(&data, chunk + 3).ok_or_else(malformed)? + 1;
+                    (out, 5 + u64::from(control >= 0xC0) + packed)
+                }
+                _ => return Err(malformed()),
+            };
+            total = total.saturating_add(out);
+            if total > max_out as u64 {
+                return Err(too_large(max_out));
+            }
+            chunk = usize::try_from(skip)
+                .ok()
+                .and_then(|skip| chunk.checked_add(skip))
+                .ok_or_else(malformed)?;
+        }
+        // The end marker, the block's padding to four bytes, its check.
+        let end = chunk + 1;
+        at = (end - at)
+            .checked_next_multiple_of(4)
+            .and_then(|block| at.checked_add(block)?.checked_add(check))
+            .ok_or_else(malformed)?;
     }
-    data.truncate(end);
     Ok(data.into())
 }
 
@@ -736,6 +756,80 @@ mod tests {
             tile
         );
         assert!(decode(&LZMADecoder, stream, tile.len() - 1).is_err());
+    }
+
+    /// Every block of a stream is shrunk, found by its chunks: a stream of three blocks, each
+    /// declaring a 4 GiB dictionary, decodes within the tile.
+    #[cfg(feature = "lzma")]
+    #[test]
+    fn every_xz_block_is_shrunk() {
+        use lzma_rust2::{XzOptions, XzWriter};
+        let tile: Vec<u8> = (0..150_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut options = XzOptions::with_preset(1);
+        options.lzma_options.dict_size = 64 << 10;
+        options.set_block_size(std::num::NonZeroU64::new(64 << 10));
+        let mut stream = vec![];
+        let mut writer = XzWriter::new(&mut stream, options).unwrap();
+        writer.write_all(&tile).unwrap();
+        writer.finish().unwrap();
+
+        // Where each block header is: after the last block's chunks, padding and CRC64.
+        let headers = |stream: &[u8]| {
+            let (mut at, mut found) = (12, vec![]);
+            while stream[at] != 0 {
+                found.push(at);
+                let n = |i: usize| usize::from(u16::from_be_bytes([stream[i], stream[i + 1]]));
+                let mut chunk = at + (usize::from(stream[at]) + 1) * 4;
+                while stream[chunk] != 0 {
+                    chunk += match stream[chunk] {
+                        1 | 2 => 3 + n(chunk + 1) + 1,
+                        c => 5 + usize::from(c >= 0xC0) + n(chunk + 3) + 1,
+                    };
+                }
+                at += (chunk + 1 - at).next_multiple_of(4) + 8;
+            }
+            found
+        };
+        let blocks = headers(&stream);
+        assert_eq!(blocks.len(), 3, "three blocks");
+        let unbounded = xz_within(Bytes::from(stream.clone()), usize::MAX).unwrap();
+        assert_eq!(unbounded, stream, "nothing to shrink for an unbounded tile");
+        // Each block declares a 4 GiB dictionary (code 40), its CRC again.
+        let mut hostile = stream.clone();
+        for &at in &blocks {
+            let size = (usize::from(hostile[at]) + 1) * 4;
+            assert_eq!(hostile[at + 2..at + 4], [0x21, 1], "one LZMA2 filter");
+            hostile[at + 4] = 40;
+            let crc = crc32fast::hash(&hostile[at..at + size - 4]);
+            hostile[at + size - 4..at + size].copy_from_slice(&crc.to_le_bytes());
+        }
+        let within = xz_within(Bytes::from(hostile.clone()), tile.len()).unwrap();
+        for &at in &blocks {
+            assert!(within[at + 4] < 40, "block at {at} shrunk");
+        }
+        assert_eq!(decode(&LZMADecoder, hostile, tile.len()).unwrap(), tile);
+    }
+
+    /// A damaged XZ stream, any byte of it, or cut short anywhere, is an error or a tile,
+    /// never a panic.
+    #[cfg(feature = "lzma")]
+    #[test]
+    fn a_damaged_xz_stream_never_panics() {
+        use lzma_rust2::{XzOptions, XzWriter};
+        let mut stream = vec![];
+        let mut writer = XzWriter::new(&mut stream, XzOptions::with_preset(6)).unwrap();
+        writer.write_all(&[7; 300]).unwrap();
+        writer.finish().unwrap();
+        for len in 0..stream.len() {
+            let _ = xz_within(Bytes::copy_from_slice(&stream[..len]), 300);
+        }
+        for at in 0..stream.len() {
+            for value in [0, 1, 2, 3, 0x7F, 0x80, 0xC0, 0xFF] {
+                let mut damaged = stream.clone();
+                damaged[at] = value;
+                let _ = xz_within(Bytes::from(damaged), 300);
+            }
+        }
     }
 
     /// Each general-purpose codec gives a tile its bytes, and refuses one

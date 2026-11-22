@@ -14,12 +14,13 @@ use crate::{ImageFileDirectory, TIFF};
 /// The most entries an IFD may have: a classic TIFF's count is a u16.
 const MAX_TAG_COUNT: u64 = 1 << 16;
 
-/// The most bytes one tag's values may take: a lying count is refused
+/// The most bytes one tag's values may take: a tag with more is skipped
 /// before anything is fetched or allocated for it.
 const MAX_TAG_BYTES: u64 = 1 << 28;
 
 /// The most values a list tag may hold (a level's chunk offsets, a byte
-/// list): each is a [`TagValue`], several times the bytes it was read from.
+/// list), or it is skipped: each is a [`TagValue`], several times the bytes
+/// it was read from.
 const MAX_TAG_VALUES: u64 = 1 << 22;
 
 /// Entry point to reading TIFF metadata.
@@ -288,7 +289,9 @@ impl ImageFileDirectoryReader {
     }
 }
 
-/// Read a single tag from the cursor: `None` when its type is unknown.
+/// Read a single tag from the cursor: `None`, skipped, when its type is unknown or it has more
+/// values than [`MAX_TAG_BYTES`] and [`MAX_TAG_VALUES`] allow (a private tag of megabytes, or a
+/// count that lies).
 async fn read_tag<F: MetadataFetch>(
     fetch: &F,
     tag_offset: u64,
@@ -309,9 +312,31 @@ async fn read_tag<F: MetadataFetch>(
         cursor.read_u32().await?.into()
     };
 
+    let bytes = count.checked_mul(tag_size(tag_type));
+    if bytes.is_none_or(|n| n > MAX_TAG_BYTES)
+        || (tag_type != Type::ASCII && count > MAX_TAG_VALUES)
+    {
+        return Ok(None);
+    }
+
     let tag_value = read_tag_value(&mut cursor, tag_type, count, bigtiff).await?;
 
     Ok(Some((tag_name, tag_value)))
+}
+
+/// The bytes one value of `tag_type` takes.
+fn tag_size(tag_type: Type) -> u64 {
+    match tag_type {
+        Type::BYTE | Type::SBYTE | Type::ASCII | Type::UNDEFINED => 1,
+        Type::SHORT | Type::SSHORT => 2,
+        Type::LONG | Type::SLONG | Type::FLOAT | Type::IFD => 4,
+        Type::LONG8
+        | Type::SLONG8
+        | Type::DOUBLE
+        | Type::RATIONAL
+        | Type::SRATIONAL
+        | Type::IFD8 => 8,
+    }
 }
 
 /// Read a tag's value from the cursor
@@ -330,22 +355,8 @@ async fn read_tag_value<F: MetadataFetch>(
         return Ok(TagValue::List(vec![]));
     }
 
-    let tag_size = match tag_type {
-        Type::BYTE | Type::SBYTE | Type::ASCII | Type::UNDEFINED => 1,
-        Type::SHORT | Type::SSHORT => 2,
-        Type::LONG | Type::SLONG | Type::FLOAT | Type::IFD => 4,
-        Type::LONG8
-        | Type::SLONG8
-        | Type::DOUBLE
-        | Type::RATIONAL
-        | Type::SRATIONAL
-        | Type::IFD8 => 8,
-    };
-
     let value_byte_length = count
-        .checked_mul(tag_size)
-        .filter(|&n| n <= MAX_TAG_BYTES)
-        .filter(|_| tag_type == Type::ASCII || count <= MAX_TAG_VALUES)
+        .checked_mul(tag_size(tag_type))
         .ok_or(TiffError::FormatError(TiffFormatError::InvalidTag))?;
 
     // Case 2: there is one value.
@@ -932,8 +943,8 @@ mod test {
         }
     }
 
-    /// A malformed entry is skipped or refused, never a panic: an unknown type, ASCII that
-    /// isn't NUL-terminated, a count no file could hold.
+    /// A malformed entry is skipped or read, never a panic: an unknown type, ASCII that isn't
+    /// NUL-terminated, more values than the reader takes.
     #[tokio::test]
     #[rustfmt::skip]
     async fn a_malformed_entry_is_skipped_or_refused() {
@@ -951,8 +962,10 @@ mod test {
             read_tag(&read(&[1,1, 2,0, 3,0,0,0, b'a',b'b',b'c',0]), 0, le, false).await.unwrap(),
             Some((Tag::from_u16_exhaustive(0x0101), TagValue::Ascii("abc".into())))
         );
-        // 2^31 LONGs
-        assert!(read_tag(&read(&[1,1, 4,0, 0xFF,0xFF,0xFF,0x7F, 8,0,0,0]), 0, le, false).await.is_err());
+        // 2^31 LONGs: skipped, nothing fetched
+        assert_eq!(read_tag(&read(&[1,1, 4,0, 0xFF,0xFF,0xFF,0x7F, 8,0,0,0]), 0, le, false).await.unwrap(), None);
+        // 5M UNDEFINED bytes, a private tag past the cap: skipped
+        assert_eq!(read_tag(&read(&[1,1, 7,0, 0x40,0x4B,0x4C,0x00, 8,0,0,0]), 0, le, false).await.unwrap(), None);
     }
 
     /// A tag repeated keeps its first value.
