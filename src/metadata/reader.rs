@@ -238,18 +238,6 @@ impl ImageFileDirectoryReader {
             .ok_or_else(|| TiffError::FormatError(TiffFormatError::InvalidTag).into())
     }
 
-    /// The tag with the specified index, `None` when its type is one TIFF doesn't define (a
-    /// reader skips such an entry).
-    async fn read_known_tag<F: MetadataFetch>(
-        &self,
-        fetch: &F,
-        tag_idx: u64,
-    ) -> AsyncTiffResult<Option<(Tag, TagValue)>> {
-        let tag_offset =
-            self.ifd_start_offset + self.tag_count_byte_size + (self.ifd_entry_byte_size * tag_idx);
-        read_tag(fetch, tag_offset, self.endianness, self.bigtiff).await
-    }
-
     /// Read all tags out of this IFD.
     ///
     /// Keep in mind that you'll still need to call [`finish`][Self::finish] to get the byte offset
@@ -257,9 +245,19 @@ impl ImageFileDirectoryReader {
     pub async fn read<F: MetadataFetch>(&self, fetch: &F) -> AsyncTiffResult<ImageFileDirectory> {
         let mut tags = HashMap::with_capacity(self.tag_count as usize);
         for tag_idx in 0..self.tag_count {
-            // A tag repeated keeps its first value, as libtiff and tifffile read it.
-            if let Some((tag, value)) = self.read_known_tag(fetch, tag_idx).await? {
-                tags.entry(tag).or_insert(value);
+            let tag_offset = self.ifd_start_offset
+                + self.tag_count_byte_size
+                + (self.ifd_entry_byte_size * tag_idx);
+            // A tag repeated keeps its first value, as libtiff and tifffile read it; a later
+            // one isn't read.
+            let mut cursor = MetadataCursor::new_with_offset(fetch, self.endianness, tag_offset);
+            if tags.contains_key(&Tag::from_u16_exhaustive(cursor.read_u16().await?)) {
+                continue;
+            }
+            if let Some((tag, value)) =
+                read_tag(fetch, tag_offset, self.endianness, self.bigtiff).await?
+            {
+                tags.insert(tag, value);
             }
         }
         ImageFileDirectory::from_tags(tags, self.endianness)
@@ -968,14 +966,15 @@ mod test {
         assert_eq!(read_tag(&read(&[1,1, 7,0, 0x40,0x4B,0x4C,0x00, 8,0,0,0]), 0, le, false).await.unwrap(), None);
     }
 
-    /// A tag repeated keeps its first value.
+    /// A tag repeated keeps its first value; a later one isn't read.
     #[tokio::test]
     #[rustfmt::skip]
     async fn a_repeated_tag_keeps_its_first_value() {
         let ifd: Vec<u8> = [
-            &[4u8, 0][..],
+            &[5u8, 0][..],
             &[0,1, 3,0, 1,0,0,0, 7,0,0,0],  // ImageWidth 7
             &[0,1, 3,0, 1,0,0,0, 9,0,0,0],  // ImageWidth 9
+            &[0,1, 4,0, 9,0,0,0, 0xFF,0xFF,0,0],  // ImageWidth, its values past the end
             &[1,1, 3,0, 1,0,0,0, 5,0,0,0],  // ImageLength 5
             &[6,1, 3,0, 1,0,0,0, 1,0,0,0],  // PhotometricInterpretation
             &[0,0,0,0],

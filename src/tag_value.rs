@@ -1,6 +1,6 @@
 use self::TagValue::{
-    Ascii, Byte, Double, Float, Ifd, IfdBig, List, Rational, RationalBig, SRational, SRationalBig,
-    Short, Signed, SignedBig, SignedByte, SignedShort, Unsigned, UnsignedBig,
+    Ascii, Byte, Double, Float, Ifd, IfdBig, List, SRational, SRationalBig, Short, Signed,
+    SignedBig, SignedByte, SignedShort, Unsigned, UnsignedBig,
 };
 use crate::error::{TiffError, TiffFormatError, TiffResult};
 // use super::error::{TiffError, TiffFormatError, TiffResult};
